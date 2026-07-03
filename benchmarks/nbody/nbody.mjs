@@ -1,5 +1,5 @@
 const RUNTIME = process.argv[2] || 'unknown';
-const ITERATIONS = 20000000; // 20 Million
+const ITERATIONS = parseInt(process.argv[3] || '20000000', 10);
 
 const PI = 3.141592653589793;
 const SOLAR_MASS = 4 * PI * PI;

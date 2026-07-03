@@ -178,7 +178,10 @@ pub fn main(init: std.process.Init) !void {
     const energy_end = system.energy();
     const time_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1e6;
 
-    std.debug.print(
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
+    const stdout = &stdout_file_writer.interface;
+    try stdout.print(
         \\{{
         \\  "runtime": "zig (release)",
         \\  "iterations": {},
@@ -195,4 +198,5 @@ pub fn main(init: std.process.Init) !void {
         time_ms,
         @as(f64, @floatFromInt(iterations)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1e9),
     });
+    try stdout_file_writer.flush();
 }

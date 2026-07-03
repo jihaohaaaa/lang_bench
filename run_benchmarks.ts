@@ -2,17 +2,13 @@ import * as colors from "jsr:@std/fmt/colors";
 import * as path from "jsr:@std/path";
 import { existsSync } from "jsr:@std/fs/exists";
 import Table from "npm:cli-table3";
+import * as p from "npm:@clack/prompts";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
-const STEPS        = 20_000_000;
-const DT           = 0.01;
-const BODIES       = 5;
-const HF_RUNS      = 30;
+const HF_RUNS      = 5;
 const HF_WARMUP    = 1;
-const REF_ENERGY_BEFORE = -0.169075164; // Expected initial system energy
-const ENERGY_TOL   = 1e-6;
 
 const isWindows  = Deno.build.os === "windows";
 const exeSuffix  = isWindows ? ".exe" : "";
@@ -46,7 +42,57 @@ function cv(mean: number, stddev: number): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. Environment detection
+// 1. Interactive TUI / Arguments Selection
+// ─────────────────────────────────────────────────────────────────────────────
+const validSuites = ["nbody", "mandelbrot", "binary_trees"];
+let suitesToRun: string[] = [];
+
+// Parse command line args
+const args = Deno.args;
+if (args.length > 0) {
+    if (args.includes("--all")) {
+        suitesToRun = [...validSuites];
+    } else {
+        // Look for comma-separated or space-separated list of suites
+        const joined = args.join(",").toLowerCase();
+        suitesToRun = validSuites.filter(s => joined.includes(s));
+    }
+}
+
+// If no arguments and stdout is a terminal, use TUI
+if (suitesToRun.length === 0) {
+    if (Deno.stdin.isTerminal()) {
+        p.intro(colors.bold(colors.green("Language Benchmarks Runner")));
+        const selected = await p.multiselect({
+            message: "Select benchmarks to run (Space to select, Enter to confirm)",
+            options: [
+                { value: "nbody", label: "N-Body Simulation", hint: "Float numerical loops (20M steps)" },
+                { value: "mandelbrot", label: "Mandelbrot Set", hint: "Float math & SIMD (4k x 4k)" },
+                { value: "binary_trees", label: "Binary Trees", hint: "GC & allocator stress (Depth 21)" }
+            ],
+            initialValues: ["nbody", "mandelbrot", "binary_trees"],
+            required: true
+        });
+        if (p.isCancel(selected)) {
+            p.cancel("Operation cancelled.");
+            Deno.exit(0);
+        }
+        suitesToRun = selected as string[];
+    } else {
+        // Non-interactive fallback: run all
+        suitesToRun = [...validSuites];
+    }
+}
+
+if (suitesToRun.length === 0) {
+    console.log(colors.red("No valid benchmarks selected to run. Exiting."));
+    Deno.exit(1);
+}
+
+console.log(colors.green(`Selected benchmarks: ${suitesToRun.join(", ")}`));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. Environment detection
 // ─────────────────────────────────────────────────────────────────────────────
 console.log(colors.yellow("\n═══ 1. Environment Detection ═══"));
 
@@ -84,7 +130,6 @@ const ramMHz: string = (() => {
     return raw !== "N/A" ? `${raw} MHz` : "N/A";
 })();
 
-// Only show power plan if readable
 const powerPlan: string | null = (() => {
     if (!isWindows) return null;
     const out = getCmdOutput("wmic", ["path", "win32_powerplan", "get", "ElementName,IsActive"]);
@@ -95,10 +140,10 @@ const powerPlan: string | null = (() => {
 })();
 
 const now       = new Date();
-const runDate   = now.toLocaleString("en-CA", { hour12: false }); // ISO-ish locale
+const runDate   = now.toLocaleString("en-CA", { hour12: false });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. Toolchain versions
+// 3. Toolchain versions
 // ─────────────────────────────────────────────────────────────────────────────
 console.log("Detecting toolchain versions...");
 
@@ -107,11 +152,9 @@ const gppVer  = (() => { const m = getCmdOutput("g++", ["--version"]).match(/(\d
 const rustVer = (() => { const m = getCmdOutput("rustc", ["--version"]).match(/rustc (\d+\.\d+\.\d+)/); return m ? `rustc ${m[1]}` : "N/A"; })();
 const zigVer  = (() => { const v = getCmdOutput("zig", ["version"]); return v !== "N/A" ? `zig ${v}` : "N/A"; })();
 const goVer   = (() => { const m = getCmdOutput("go", ["version"]).match(/go(\d+\.\d+\.\d+)/); return m ? `go ${m[1]}` : "N/A"; })();
-const juliaVer= (() => { const m = getCmdOutput("julia", ["--version"]).match(/(\d+\.\d+\.\d+)/); return m ? `julia ${m[1]}` : "N/A"; })();
 const nodeVer = (() => { const v = getCmdOutput("node", ["--version"]); return v !== "N/A" ? `node ${v}` : "N/A"; })();
 const denoVer = (() => { const m = getCmdOutput("deno", ["--version"]).match(/deno (\d+\.\d+\.\d+)/); return m ? `deno ${m[1]}` : "N/A"; })();
 const bunVer  = (() => { const v = getCmdOutput("bun", ["--version"]); return v !== "N/A" ? `bun ${v}` : "N/A"; })();
-const luajitVer = (() => { const m = getCmdOutput("luajit", ["-v"]).match(/LuaJIT (\d+\.\d+\.\d+[-\w]*)/); return m ? `luajit ${m[1]}` : "N/A"; })();
 const hfVer   = (() => { const m = getCmdOutput("hyperfine", ["--version"]).match(/(\d+\.\d+\.\d+)/); return m ? `hyperfine ${m[1]}` : "N/A"; })();
 
 let msvcVer = "N/A";
@@ -128,242 +171,348 @@ if (isWindows) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. Compile
+// 4. Compile
 // ─────────────────────────────────────────────────────────────────────────────
 console.log(colors.yellow("\n═══ 2. Compilation (Release) ═══"));
 Deno.mkdirSync("target", { recursive: true });
 
-// C flags
 const C_FLAGS   = ["-O3", "-march=native", "-ffast-math"];
 const CXX_FLAGS = ["-O3", "-march=native", "-ffast-math"];
-// Rust: lto=thin is effective on single-file; fat caused ~35% regression in testing
 const RUST_FLAGS = ["-C", "opt-level=3", "-C", "codegen-units=1", "-C", "panic=abort", "-C", "target-cpu=native", "-C", "lto=thin"];
 
-try {
-    runCmd("gcc", [...C_FLAGS,   "-o", `target/nbody_c${exeSuffix}`,   "nbody.c"]);
-    runCmd("g++", [...CXX_FLAGS, "-o", `target/nbody_cpp${exeSuffix}`, "nbody.cpp"]);
+for (const suite of suitesToRun) {
+    console.log(colors.blue(`\n--- Compiling ${suite} ---`));
+    
+    // GCC C
+    runCmd("gcc", [...C_FLAGS, "-o", `target/${suite}_c${exeSuffix}`, `benchmarks/${suite}/${suite}.c`]);
+    
+    // GCC C++
+    runCmd("g++", [...CXX_FLAGS, "-o", `target/${suite}_cpp${exeSuffix}`, `benchmarks/${suite}/${suite}.cpp`]);
 
+    // MSVC C++
     if (isWindows) {
-        console.log(colors.cyan('> cl.exe /O2 /fp:fast /arch:AVX2 /GL ... /link /LTCG'));
+        console.log(colors.cyan(`> cl.exe /std:c++17 /O2 /fp:fast /arch:AVX2 /GL ... /link /LTCG`));
         const msvcCmd = new Deno.Command("cmd.exe", {
-            args: ["/c", 'call "F:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat" && cl /O2 /fp:fast /arch:AVX2 /GL /Fo:target/nbody.obj /Fe:target/nbody_msvc.exe nbody.cpp /link /LTCG'],
+            args: ["/c", `call "F:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat" && cl /std:c++17 /O2 /fp:fast /arch:AVX2 /GL /Fo:target/${suite}.obj /Fe:target/${suite}_msvc.exe benchmarks/${suite}/${suite}.cpp /link /LTCG`],
             stdout: "inherit", stderr: "inherit", windowsRawArguments: true
         });
         const { code } = msvcCmd.outputSync();
-        if (code !== 0) console.log(colors.yellow("Warning: MSVC compilation failed."));
-        else { try { Deno.removeSync("target/nbody.obj"); } catch { /**/ } }
+        if (code !== 0) console.log(colors.yellow(`Warning: MSVC compilation failed for ${suite}.`));
+        else { try { Deno.removeSync(`target/${suite}.obj`); } catch { /**/ } }
     }
 
-    runCmd("go",  ["build", "-ldflags", "-s -w", "-o", `target/nbody_go${exeSuffix}`, "nbody.go"]);
-    runCmd("rustc", [...RUST_FLAGS, "-o", `target/nbody_rust${exeSuffix}`, "nbody.rs"]);
+    // Go
+    runCmd("go", ["build", "-ldflags", "-s -w", "-o", `target/${suite}_go${exeSuffix}`, `benchmarks/${suite}/${suite}.go`]);
+    
+    // Rust
+    runCmd("rustc", [...RUST_FLAGS, "-o", `target/${suite}_rust${exeSuffix}`, `benchmarks/${suite}/${suite}.rs`]);
 
-    runCmd("zig", ["build-exe", "-O", "ReleaseFast", "-femit-bin=target/nbody_zig", "nbody.zig"]);
-    if (isWindows && existsSync("target/nbody_zig")) {
-        Deno.renameSync("target/nbody_zig", "target/nbody_zig.exe");
+    // Zig
+    runCmd("zig", ["build-exe", "-O", "ReleaseFast", `-femit-bin=target/${suite}_zig`, `benchmarks/${suite}/${suite}.zig`]);
+    if (isWindows && existsSync(`target/${suite}_zig`)) {
+        Deno.renameSync(`target/${suite}_zig`, `target/${suite}_zig.exe`);
     }
+}
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // 4. Correctness verification
-    // ─────────────────────────────────────────────────────────────────────────
-    console.log(colors.yellow("\n═══ 3. Correctness Verification ═══"));
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. Correctness verification
+// ─────────────────────────────────────────────────────────────────────────────
+console.log(colors.yellow("\n═══ 3. Correctness Verification ═══"));
 
-    interface CorrectnessResult { name: string; energyBefore: number | null; energyAfter: number | null; pass: boolean; note: string; }
+interface CorrectnessResult {
+    name: string;
+    passed: boolean;
+    output: string;
+    details: string;
+}
 
-    function verifyBinary(name: string, cmd: string, args: string[]): CorrectnessResult {
-        try {
-            const proc = new Deno.Command(cmd, { args: [...args, "1000"], stdout: "piped", stderr: "piped" });
-            const { stdout, stderr, code } = proc.outputSync();
-            if (code !== 0) return { name, energyBefore: null, energyAfter: null, pass: false, note: "non-zero exit" };
-            const dec = new TextDecoder();
-            // Zig writes to stderr (std.debug.print), others to stdout — try both
-            const combined = dec.decode(stdout) + dec.decode(stderr);
-            const jsonStart = combined.indexOf("{");
-            if (jsonStart === -1) return { name, energyBefore: null, energyAfter: null, pass: false, note: "no JSON in output" };
-            // Sanitize non-standard JSON numeric tokens: inf, +Inf, -Inf, nan
-            const sanitized = combined.slice(jsonStart)
-                .replace(/:\s*[+-]?[Ii]nf(inity)?/g, ": 1e308")
-                .replace(/:\s*[Nn]a[Nn]/g, ": 0");
-            const json = JSON.parse(sanitized);
-            const eb: number = json.energyBefore;
-            const ea: number = json.energyAfter;
-            const pass = Math.abs(eb - REF_ENERGY_BEFORE) < ENERGY_TOL;
-            return { name, energyBefore: eb, energyAfter: ea, pass, note: pass ? "PASS" : `energyBefore delta=${(eb - REF_ENERGY_BEFORE).toExponential(2)}` };
-        } catch (e) {
-            return { name, energyBefore: null, energyAfter: null, pass: false, note: String(e) };
+const REF_ENERGY_BEFORE = -0.169075164;
+const ENERGY_TOL = 1e-6;
+const REF_MANDEL_CHECKSUM = 397380;
+const REF_TREES_CHECKSUM = 131759;
+
+function verifyImplementation(
+    suite: string,
+    name: string,
+    cmd: string,
+    args: string[]
+): CorrectnessResult {
+    try {
+        const proc = new Deno.Command(cmd, { args, stdout: "piped", stderr: "piped" });
+        const { stdout, stderr, code } = proc.outputSync();
+        const dec = new TextDecoder();
+        
+        // Output JSON is strictly expected on stdout. Stderr can contain general logging (like stretch tree messages)
+        const stdoutText = dec.decode(stdout).trim();
+        const stderrText = dec.decode(stderr).trim();
+        
+        if (code !== 0) {
+            return { name, passed: false, output: stdoutText, details: `non-zero exit code ${code}. Stderr: ${stderrText}` };
         }
+        
+        const jsonStart = stdoutText.indexOf("{");
+        if (jsonStart === -1) {
+            return { name, passed: false, output: stdoutText, details: "no JSON found in stdout" };
+        }
+        
+        const sanitized = stdoutText.slice(jsonStart)
+            .replace(/:\s*[+-]?[Ii]nf(inity)?/g, ": 1e308")
+            .replace(/:\s*[Nn]a[Nn]/g, ": 0");
+            
+        const data = JSON.parse(sanitized);
+        
+        if (suite === "nbody") {
+            const eb = data.energyBefore;
+            const ea = data.energyAfter;
+            if (eb == null || ea == null) {
+                return { name, passed: false, output: sanitized, details: "missing energy fields" };
+            }
+            const diff = Math.abs(eb - REF_ENERGY_BEFORE);
+            const passed = diff < ENERGY_TOL;
+            return {
+                name,
+                passed,
+                output: `Before: ${eb.toFixed(9)}, After: ${ea.toFixed(9)}`,
+                details: passed ? "PASS" : `energyBefore delta = ${diff.toExponential(2)}`
+            };
+        } else if (suite === "mandelbrot") {
+            const cs = data.checksum;
+            if (cs == null) {
+                return { name, passed: false, output: sanitized, details: "missing checksum field" };
+            }
+            const passed = cs === REF_MANDEL_CHECKSUM;
+            return {
+                name,
+                passed,
+                output: `Checksum: ${cs}`,
+                details: passed ? "PASS" : `expected ${REF_MANDEL_CHECKSUM}, got ${cs}`
+            };
+        } else { // binary_trees
+            const cs = data.checksum;
+            if (cs == null) {
+                return { name, passed: false, output: sanitized, details: "missing checksum field" };
+            }
+            const passed = cs === REF_TREES_CHECKSUM;
+            return {
+                name,
+                passed,
+                output: `Checksum: ${cs}`,
+                details: passed ? "PASS" : `expected ${REF_TREES_CHECKSUM}, got ${cs}`
+            };
+        }
+    } catch (e) {
+        return { name, passed: false, output: "", details: String(e) };
     }
+}
 
-    const correctnessChecks: CorrectnessResult[] = [
-        verifyBinary("C (GCC)",    `target/nbody_c${exeSuffix}`,    []),
-        verifyBinary("C++ (GCC)",  `target/nbody_cpp${exeSuffix}`,  []),
-        verifyBinary("Rust",       `target/nbody_rust${exeSuffix}`, []),
-        verifyBinary("Zig",        `target/nbody_zig${exeSuffix}`,  []),
-        verifyBinary("Go",         `target/nbody_go${exeSuffix}`,   []),
-        verifyBinary("Julia",      "julia",  ["nbody.jl"]),
-        verifyBinary("Node.js",    "node",   ["nbody_benchmark.mjs", "node"]),
-        verifyBinary("Deno",       "deno",   ["run", "-A", "nbody_benchmark.mjs", "deno"]),
-        verifyBinary("Bun",        "bun",    ["nbody_benchmark.mjs", "bun"]),
-        verifyBinary("LuaJIT",     "luajit", ["nbody_benchmark.lua", "1000", "luajit"]),
+const correctnessMap: Record<string, CorrectnessResult[]> = {};
+
+for (const suite of suitesToRun) {
+    console.log(colors.blue(`\nVerifying correctness of ${suite}...`));
+    
+    const sizeArg = suite === "binary_trees" ? "10" : "1000";
+    
+    const targets = [
+        { name: "C (GCC)", cmd: `target/${suite}_c${exeSuffix}`, args: [sizeArg] },
+        { name: "C++ (GCC)", cmd: `target/${suite}_cpp${exeSuffix}`, args: [sizeArg] },
+        { name: "Rust", cmd: `target/${suite}_rust${exeSuffix}`, args: [sizeArg] },
+        { name: "Zig", cmd: `target/${suite}_zig${exeSuffix}`, args: [sizeArg] },
+        { name: "Go", cmd: `target/${suite}_go${exeSuffix}`, args: [sizeArg] },
+        { name: "Node.js", cmd: "node", args: [`benchmarks/${suite}/${suite}.mjs`, "node", sizeArg] },
+        { name: "Deno", cmd: "deno", args: ["run", "-A", `benchmarks/${suite}/${suite}.mjs`, "deno", sizeArg] },
+        { name: "Bun", cmd: "bun", args: [`benchmarks/${suite}/${suite}.mjs`, "bun", sizeArg] },
     ];
-    if (isWindows && existsSync("target/nbody_msvc.exe")) {
-        correctnessChecks.push(verifyBinary("C++ (MSVC)", "target/nbody_msvc.exe", []));
+    
+    if (isWindows && existsSync(`target/${suite}_msvc.exe`)) {
+        targets.push({ name: "C++ (MSVC)", cmd: `target/${suite}_msvc.exe`, args: [sizeArg] });
     }
-
-    const corTable = new Table({
-        head: [colors.bold("Runtime"), colors.bold("energyBefore"), colors.bold("energyAfter (1k steps)"), colors.bold("Status")],
+    
+    const suiteResults: CorrectnessResult[] = [];
+    
+    const table = new Table({
+        head: [colors.bold("Runtime"), colors.bold("Output Summary"), colors.bold("Status")],
         style: { head: ["cyan"], border: ["gray"] }
     });
-    for (const r of correctnessChecks) {
-        const status = r.pass ? colors.green("✓ PASS") : colors.red(`✗ FAIL  ${r.note}`);
-        corTable.push([r.name, r.energyBefore?.toFixed(9) ?? "N/A", r.energyAfter?.toFixed(9) ?? "N/A", status]);
+    
+    for (const tgt of targets) {
+        const res = verifyImplementation(suite, tgt.name, tgt.cmd, tgt.args);
+        suiteResults.push(res);
+        
+        const status = res.passed
+            ? colors.green("✓ PASS")
+            : colors.red(`✗ FAIL  (${res.details})`);
+        table.push([tgt.name, res.output, status]);
     }
-    console.log(corTable.toString());
-    const allPass = correctnessChecks.every(r => r.pass);
-    if (!allPass) console.log(colors.red("WARNING: Some correctness checks failed – results may not be comparable!"));
+    
+    console.log(table.toString());
+    correctnessMap[suite] = suiteResults;
+    
+    const allPass = suiteResults.every(r => r.passed);
+    if (!allPass) {
+        console.log(colors.red(`WARNING: Some correctness checks failed for ${suite}!`));
+    }
+}
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // 5. Benchmark
-    // ─────────────────────────────────────────────────────────────────────────
-    console.log(colors.yellow("\n═══ 4. Hyperfine Benchmark ═══"));
-    if (existsSync("target/results.json")) Deno.removeSync("target/results.json");
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. Benchmark (Hyperfine)
+// ─────────────────────────────────────────────────────────────────────────────
+console.log(colors.yellow("\n═══ 4. Hyperfine Benchmarks ═══"));
 
-    const targets: string[] = [
-        `${pathPrefix}nbody_c${exeSuffix}`,
-        `${pathPrefix}nbody_cpp${exeSuffix} gcc`,
-        `${pathPrefix}nbody_rust${exeSuffix}`,
-        `${pathPrefix}nbody_zig${exeSuffix}`,
-        `${pathPrefix}nbody_go${exeSuffix}`,
-        "julia nbody.jl 20000000",
-        "node nbody_benchmark.mjs node",
-        "deno run -A nbody_benchmark.mjs deno",
-        "bun nbody_benchmark.mjs bun",
-        "luajit nbody_benchmark.lua 20000000 luajit",
+const suiteConfigs = {
+    nbody: {
+        args: ["20000000"],
+        jsonOut: "target/results_nbody.json",
+        title: "N-Body (5-body Solar System)",
+        desc: "20M steps. Floating-point numerical loop."
+    },
+    mandelbrot: {
+        args: ["8000"],
+        jsonOut: "target/results_mandelbrot.json",
+        title: "Mandelbrot",
+        desc: "8k x 8k complex plane. Floats & SIMD efficiency."
+    },
+    binary_trees: {
+        args: ["18"],
+        jsonOut: "target/results_binary_trees.json",
+        title: "Binary Trees",
+        desc: "Max Depth 18. Dynamic allocations and GC stress."
+    }
+};
+
+for (const suite of suitesToRun) {
+    console.log(colors.blue(`\nRunning Hyperfine for ${suite}...`));
+    const config = suiteConfigs[suite as keyof typeof suiteConfigs];
+    
+    if (existsSync(config.jsonOut)) {
+        Deno.removeSync(config.jsonOut);
+    }
+    
+    const runArgs = config.args[0];
+    
+    const targets = [
+        `${pathPrefix}${suite}_c${exeSuffix} ${runArgs}`,
+        `${pathPrefix}${suite}_cpp${exeSuffix} ${runArgs}`,
+        `${pathPrefix}${suite}_rust${exeSuffix} ${runArgs}`,
+        `${pathPrefix}${suite}_zig${exeSuffix} ${runArgs}`,
+        `${pathPrefix}${suite}_go${exeSuffix} ${runArgs}`,
+        `node benchmarks/${suite}/${suite}.mjs node ${runArgs}`,
+        `deno run -A benchmarks/${suite}/${suite}.mjs deno ${runArgs}`,
+        `bun benchmarks/${suite}/${suite}.mjs bun ${runArgs}`,
     ];
-    if (isWindows && existsSync("target/nbody_msvc.exe")) {
-        targets.push(`${pathPrefix}nbody_msvc.exe msvc`);
+    
+    if (isWindows && existsSync(`target/${suite}_msvc.exe`)) {
+        targets.push(`${pathPrefix}${suite}_msvc.exe ${runArgs}`);
     }
-
+    
     runCmd("hyperfine", [
-        "--runs",   String(HF_RUNS),
+        "--runs", String(HF_RUNS),
         "--warmup", String(HF_WARMUP),
-        "--export-json", "target/results.json",
+        "--export-json", config.jsonOut,
         ...targets
     ]);
+}
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // 6. Report generation
-    // ─────────────────────────────────────────────────────────────────────────
-    console.log(colors.yellow("\n═══ 5. Generating Report ═══"));
-    if (!existsSync("target/results.json")) throw new Error("results.json missing");
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. Report Generation (Separated Reports)
+// ─────────────────────────────────────────────────────────────────────────────
+console.log(colors.yellow("\n═══ 5. Generating Separated Reports ═══"));
 
-    interface BenchResult { command: string; mean: number; stddev: number; median: number; min: number; max: number; }
-    const data = JSON.parse(Deno.readTextFileSync("target/results.json"));
-    const sorted: BenchResult[] = [...data.results].sort((a, b) => a.mean - b.mean);
-    const fastest = sorted[0].mean;
+interface BenchResult {
+    command: string;
+    mean: number;
+    stddev: number;
+    median: number;
+    min: number;
+    max: number;
+}
 
-    // ── Runtime metadata ──
-    interface RuntimeMeta { display: string; compiler: string; flags: string; lang: string; notes: string; }
-    function getMeta(cmd: string): RuntimeMeta {
-        if (cmd.includes("nbody_zig"))                        return { display: "Zig",        compiler: zigVer,   flags: "-O ReleaseFast",                              lang: "Zig",      notes: "Stack-allocated [5]Body array, compile-time bounds" };
-        if (cmd.includes("nbody_rust"))                       return { display: "Rust",       compiler: rustVer,  flags: "opt-level=3, target-cpu=native, lto=thin",   lang: "Rust",     notes: "Vec<Body> heap-allocated; unsafe inner loop" };
-        if (cmd.includes("nbody_msvc"))                       return { display: "C++ (MSVC)", compiler: msvcVer,  flags: "/O2 /fp:fast /arch:AVX2 /GL /LTCG",          lang: "C++",      notes: "" };
-        if (cmd.includes("nbody_cpp"))                        return { display: "C++ (GCC)",  compiler: gppVer,   flags: "-O3 -march=native -ffast-math",               lang: "C++",      notes: "" };
-        if (cmd.includes("nbody_c"))                          return { display: "C (GCC)",    compiler: gccVer,   flags: "-O3 -march=native -ffast-math",               lang: "C",        notes: "" };
-        if (cmd.includes("nbody_go"))                         return { display: "Go",         compiler: goVer,    flags: "-ldflags \"-s -w\"",                          lang: "Go",       notes: "No explicit SIMD control; GC may affect variance" };
-        if (cmd.includes("julia"))                            return { display: "Julia",      compiler: juliaVer, flags: "@fastmath + @inbounds",                       lang: "Julia",    notes: "LLVM JIT; includes JIT compilation overhead despite warmup" };
-        if (cmd.includes("node"))                             return { display: "Node.js",    compiler: nodeVer,  flags: "V8 TurboFan JIT",                            lang: "JS",       notes: "TypedArray (Float64Array)" };
-        if (cmd.includes("deno"))                             return { display: "Deno",       compiler: denoVer,  flags: "V8 TurboFan JIT",                            lang: "JS",       notes: "TypedArray (Float64Array)" };
-        if (cmd.includes("bun"))                              return { display: "Bun",        compiler: bunVer,   flags: "JSC JIT",                                     lang: "JS",       notes: "TypedArray (Float64Array)" };
-        if (cmd.includes("luajit"))                           return { display: "LuaJIT",     compiler: luajitVer,flags: "JIT (DYJIT)",                                 lang: "Lua",      notes: "Plain Lua tables; no FFI" };
-        return { display: cmd, compiler: "N/A", flags: "N/A", lang: "N/A", notes: "" };
-    }
+function getDisplayInfo(cmd: string, suite: string) {
+    if (cmd.includes(`${suite}_zig`)) return { display: "Zig", compiler: zigVer, flags: "-O ReleaseFast" };
+    if (cmd.includes(`${suite}_rust`)) return { display: "Rust", compiler: rustVer, flags: "-C opt-level=3 ... lto=thin" };
+    if (cmd.includes(`${suite}_msvc`)) return { display: "C++ (MSVC)", compiler: msvcVer, flags: "/O2 /fp:fast /arch:AVX2 /GL /LTCG" };
+    if (cmd.includes(`${suite}_cpp`)) return { display: "C++ (GCC)", compiler: gppVer, flags: "-O3 -march=native -ffast-math" };
+    if (cmd.includes(`${suite}_c`)) return { display: "C (GCC)", compiler: gccVer, flags: "-O3 -march=native -ffast-math" };
+    if (cmd.includes(`${suite}_go`)) return { display: "Go", compiler: goVer, flags: "-ldflags \"-s -w\"" };
+    if (cmd.includes("node")) return { display: "Node.js", compiler: nodeVer, flags: "V8 JIT" };
+    if (cmd.includes("deno")) return { display: "Deno", compiler: denoVer, flags: "V8 JIT" };
+    if (cmd.includes("bun")) return { display: "Bun", compiler: bunVer, flags: "JSC JIT" };
+    return { display: cmd, compiler: "N/A", flags: "N/A" };
+}
 
-    // ── Console table ──
-    const consoleTable = new Table({
-        head: [
-            colors.bold("#"),
-            colors.bold("Runtime"),
-            colors.bold("Compiler / Version"),
-            colors.bold("Min"),
-            colors.bold("Median"),
-            colors.bold("Mean"),
-            colors.bold("Max"),
-            colors.bold("StdDev"),
-            colors.bold("CV"),
-            colors.bold("Relative Runtime"),
-        ],
-        style: { head: ["cyan"], border: ["gray"] }
+function buildSVG(suite: string, title: string, items: Array<{ name: string; mean: number }>): string {
+    const W = 640, barH = 24, gap = 12, lPad = 130, rPad = 90, topPad = 55, botPad = 20;
+    const totalH = topPad + botPad + items.length * (barH + gap) - gap;
+    const maxMean = Math.max(...items.map(r => r.mean));
+    const avail = W - lPad - rPad;
+    
+    let s = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${totalH}" width="100%" style="background:#1a1a22;font-family:system-ui,sans-serif;border-radius:10px;">\n`;
+    s += `  <text x="16" y="34" fill="#f1f3f5" font-size="14" font-weight="700">${title} · ${HF_RUNS} runs · Lower is better</text>\n`;
+    items.forEach((it, i) => {
+        const y = topPad + i * (barH + gap);
+        const w = (it.mean / maxMean) * avail;
+        const hue = Math.round((1 - it.mean / maxMean) * 120);
+        const color = `hsl(${hue},68%,52%)`;
+        const label = fmt(it.mean);
+        s += `  <text x="${lPad - 8}" y="${y + barH - 6}" fill="#dee2e6" font-size="12" font-weight="500" text-anchor="end">${it.name}</text>\n`;
+        s += `  <rect x="${lPad}" y="${y}" width="${avail}" height="${barH}" rx="5" fill="#2d2d3a"/>\n`;
+        s += `  <rect x="${lPad}" y="${y}" width="${w.toFixed(1)}" height="${barH}" rx="5" fill="${color}"/>\n`;
+        s += `  <text x="${lPad + w + 7}" y="${y + barH - 6}" fill="#f8f9fa" font-size="11" font-weight="700">${label}</text>\n`;
     });
+    s += `</svg>`;
+    return s;
+}
 
-    sorted.forEach((r, i) => {
-        const m = getMeta(r.command);
-        const rel = r.mean / fastest;
-        const relStr = i === 0 ? colors.green("1.00× (fastest) 🏆") : colors.yellow(`${rel.toFixed(2)}×`);
-        consoleTable.push([
-            String(i + 1),
-            i === 0 ? colors.green(colors.bold(m.display)) : m.display,
-            m.compiler,
-            fmt(r.min), fmt(r.median), fmt(r.mean), fmt(r.max), fmt(r.stddev),
-            cv(r.mean, r.stddev),
-            relStr
-        ]);
-    });
+// Generate base name for this run
+const YYYY = now.getFullYear(), MM = String(now.getMonth()+1).padStart(2,"0"), DD = String(now.getDate()).padStart(2,"0");
+const dateStr   = `${YYYY}-${MM}-${DD}`;
+const systemStr = `${Deno.build.os}_${Deno.build.arch}`;
+await Deno.mkdir("report", { recursive: true });
 
-    console.log("\n" + colors.bold(colors.green("═══ Performance Results (sorted by mean time) ═══")));
-    console.log(consoleTable.toString());
-
-    // ── SVG chart ──
-    function buildSVG(items: Array<{ name: string; mean: number }>): string {
-        const W = 640, barH = 24, gap = 12, lPad = 130, rPad = 90, topPad = 55, botPad = 20;
-        const totalH = topPad + botPad + items.length * (barH + gap) - gap;
-        const maxMean = Math.max(...items.map(r => r.mean));
-        const avail = W - lPad - rPad;
-        let s = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${totalH}" width="100%" style="background:#1a1a22;font-family:system-ui,sans-serif;border-radius:10px;">\n`;
-        s += `  <text x="16" y="34" fill="#f1f3f5" font-size="14" font-weight="700">N-Body (5-body Solar System) · ${HF_RUNS} runs · Lower is better</text>\n`;
-        items.forEach((it, i) => {
-            const y = topPad + i * (barH + gap);
-            const w = (it.mean / maxMean) * avail;
-            const hue = Math.round((1 - it.mean / maxMean) * 120);
-            const color = `hsl(${hue},68%,52%)`;
-            const label = it.mean < 1 ? `${(it.mean * 1000).toFixed(0)} ms` : `${it.mean.toFixed(3)} s`;
-            s += `  <text x="${lPad - 8}" y="${y + barH - 6}" fill="#dee2e6" font-size="12" font-weight="500" text-anchor="end">${it.name}</text>\n`;
-            s += `  <rect x="${lPad}" y="${y}" width="${avail}" height="${barH}" rx="5" fill="#2d2d3a"/>\n`;
-            s += `  <rect x="${lPad}" y="${y}" width="${w.toFixed(1)}" height="${barH}" rx="5" fill="${color}"/>\n`;
-            s += `  <text x="${lPad + w + 7}" y="${y + barH - 6}" fill="#f8f9fa" font-size="11" font-weight="700">${label}</text>\n`;
-        });
-        s += `</svg>`;
-        return s;
-    }
-
-    // ── Naming / folders ──
-    const YYYY = now.getFullYear(), MM = String(now.getMonth()+1).padStart(2,"0"), DD = String(now.getDate()).padStart(2,"0");
-    const dateStr   = `${YYYY}-${MM}-${DD}`;
-    const systemStr = `${Deno.build.os}_${Deno.build.arch}`;
-    await Deno.mkdir("report", { recursive: true });
-
-    let runNumber = 1;
-    for await (const e of Deno.readDir("report")) {
-        if (e.isFile && e.name.startsWith(`${dateStr}_${systemStr}_run`) && e.name.endsWith(".md")) {
-            const m = e.name.match(/_run(\d+)\.md$/);
-            if (m) { const n = parseInt(m[1], 10); if (n >= runNumber) runNumber = n + 1; }
+let runNumber = 1;
+for await (const e of Deno.readDir("report")) {
+    if (e.isFile && e.name.startsWith(`${dateStr}_${systemStr}_run`) && e.name.endsWith(".md")) {
+        const m = e.name.match(/_run(\d+)(?:_\w+)?\.md$/);
+        if (m) {
+            const n = parseInt(m[1], 10);
+            if (n >= runNumber) runNumber = n + 1;
         }
     }
+}
 
-    const baseName     = `${dateStr}_${systemStr}_run${runNumber}`;
-    const reportPath   = `report/${baseName}.md`;
-    const chartPath    = `report/${baseName}.svg`;
+const baseRunName = `${dateStr}_${systemStr}_run${runNumber}`;
 
-    // ── Build SVG ──
-    Deno.writeTextFileSync(chartPath, buildSVG(sorted.map(r => ({ name: getMeta(r.command).display, mean: r.mean }))));
+// Generate a separate report for each suite
+for (const suite of suitesToRun) {
+    const config = suiteConfigs[suite as keyof typeof suiteConfigs];
+    const resultsFile = config.jsonOut;
+    
+    if (!existsSync(resultsFile)) {
+        throw new Error(`${resultsFile} missing`);
+    }
+    
+    const data = JSON.parse(Deno.readTextFileSync(resultsFile));
+    const sorted: BenchResult[] = [...data.results].sort((a, b) => a.mean - b.mean);
+    const fastest = sorted[0].mean;
+    
+    // Save SVG Chart for this specific benchmark
+    const svgFileName = `${baseRunName}_${suite}.svg`;
+    const svgPath = `report/${svgFileName}`;
+    const svgContent = buildSVG(
+        suite,
+        config.title,
+        sorted.map(r => ({ name: getDisplayInfo(r.command, suite).display, mean: r.mean }))
+    );
+    Deno.writeTextFileSync(svgPath, svgContent);
+    console.log(colors.green(`✓ Chart Generated: ${svgPath}`));
 
-    // ── Build Markdown ──
-    const hasMsvc = isWindows && existsSync("target/nbody_msvc.exe");
-    const correctnessMap = new Map(correctnessChecks.map(r => [r.name, r]));
+    // Generate Markdown report for this specific benchmark
+    const reportFileName = `${baseRunName}_${suite}.md`;
+    const reportPath = `report/${reportFileName}`;
+    
+    let md = `# Benchmark Report: ${config.title} — ${baseRunName}\n\n`;
+    md += `> **Benchmark Variant:** ${config.desc}\n\n`;
 
-    let md = `# N-Body Benchmark Report — ${baseName}\n\n`;
-    md += `> **Benchmark Variant:** Computer Language Benchmarks Game · 5-body Solar System\n\n`;
-
-    // System Environment
+    // 🖥️ System Environment Section
     md += `## 🖥️ System Environment\n\n`;
     md += `| Field | Value |\n| :--- | :--- |\n`;
     md += `| Date | ${runDate} |\n`;
@@ -374,82 +523,67 @@ try {
     if (powerPlan) md += `| Power Plan | ${powerPlan} |\n`;
     md += `\n`;
 
-    // Benchmark Specifications
-    md += `## 🔬 Benchmark Specifications\n\n`;
-    md += `| Parameter | Value |\n| :--- | :--- |\n`;
-    md += `| Benchmark variant | Computer Language Benchmarks Game — 5-body Solar System |\n`;
-    md += `| Bodies | ${BODIES} (Sun, Jupiter, Saturn, Uranus, Neptune) |\n`;
-    md += `| Steps | ${STEPS.toLocaleString()} |\n`;
-    md += `| dt | ${DT} |\n`;
-    md += `| Threading | Single-threaded |\n`;
-    md += `| Output (inside loop) | None — only final energy value printed as correctness checksum |\n`;
-    md += `| Native ISA optimization | \`-march=native\` / \`/arch:AVX2\` enabled for compiled languages; automatic vectorization depends on each compiler's optimizer |\n`;
-    md += `| Benchmark tool | ${hfVer} |\n`;
-    md += `| Runs | ${HF_RUNS} (+ ${HF_WARMUP} warmup to allow JIT stabilisation) |\n`;
-    md += `| Statistics | Mean, Median, Min, Max, StdDev, CV |\n`;
-    md += `\n`;
-
-    // Compiler Configuration table
+    // 🛠️ Compiler & Runtime Configuration Section
     md += `## 🛠️ Compiler / Runtime Configuration\n\n`;
     md += `| Language | Runtime / Compiler | Optimization Flags | Notes |\n`;
     md += `| :--- | :--- | :--- | :--- |\n`;
     md += `| C | ${gccVer} | \`-O3 -march=native -ffast-math\` | |\n`;
-    md += `| C++ | ${gppVer} | \`-O3 -march=native -ffast-math\` | |\n`;
-    if (hasMsvc) md += `| C++ | ${msvcVer} | \`/O2 /fp:fast /arch:AVX2 /GL /LTCG\` | Global optimization + Link-time code gen |\n`;
-    md += `| Rust | ${rustVer} | \`opt-level=3, codegen-units=1, panic=abort, target-cpu=native, lto=thin\` | \`Vec<Body>\` (heap); \`unsafe\` inner loop |\n`;
-    md += `| Zig | ${zigVer} | \`-O ReleaseFast\` | \`[5]Body\` stack array; compile-time bounds |\n`;
-    md += `| Go | ${goVer} | \`-ldflags "-s -w"\` | No explicit SIMD; GC pauses may affect variance |\n`;
-    md += `| Julia | ${juliaVer} | \`@fastmath\` + \`@inbounds\` | LLVM JIT; JIT overhead present even after warmup |\n`;
-    md += `| JavaScript | ${nodeVer} (V8 TurboFan) | — | \`Float64Array\` typed arrays |\n`;
-    md += `| JavaScript | ${denoVer} (V8 TurboFan) | — | \`Float64Array\` typed arrays |\n`;
-    md += `| JavaScript | ${bunVer} (JSC JIT) | — | \`Float64Array\` typed arrays |\n`;
-    md += `| Lua | ${luajitVer} (DynASM JIT) | — | Plain Lua tables; no FFI |\n`;
+    md += `| C++ (GCC) | ${gppVer} | \`-O3 -march=native -ffast-math\` | |\n`;
+    if (isWindows && msvcVer !== "N/A") {
+        md += `| C++ (MSVC) | ${msvcVer} | \`/O2 /std:c++17 /fp:fast /arch:AVX2 /GL /LTCG\` | Global optimization + Link-time code gen |\n`;
+    }
+    md += `| Rust | ${rustVer} | \`opt-level=3, codegen-units=1, panic=abort, target-cpu=native, lto=thin\` | |\n`;
+    md += `| Zig | ${zigVer} | \`-O ReleaseFast\` | |\n`;
+    md += `| Go | ${goVer} | \`-ldflags "-s -w"\` | |\n`;
+    md += `| JavaScript (Node) | ${nodeVer} | — | V8 engine JIT |\n`;
+    md += `| JavaScript (Deno) | ${denoVer} | — | Deno V8 engine JIT |\n`;
+    md += `| JavaScript (Bun)  | ${bunVer}  | — | JSC engine JIT |\n`;
     md += `\n`;
-
-    // Correctness
+    
+    // Correctness Section
     md += `## ✅ Correctness Verification\n\n`;
-    md += `All implementations run with **1,000 steps** and their initial system energy is compared against the reference value.\n\n`;
-    md += `> **Reference energyBefore** = \`${REF_ENERGY_BEFORE}\` (tolerance ± ${ENERGY_TOL})\n\n`;
-    md += `| Runtime | energyBefore | energyAfter (1k steps) | Result |\n`;
-    md += `| :--- | :---: | :---: | :---: |\n`;
-    for (const r of correctnessChecks) {
-        const status = r.pass ? "✅ PASS" : `❌ FAIL (${r.note})`;
-        md += `| ${r.name} | \`${r.energyBefore?.toFixed(9) ?? "N/A"}\` | \`${r.energyAfter?.toFixed(9) ?? "N/A"}\` | ${status} |\n`;
+    const rapidArg = suite === "binary_trees" ? "10" : "1000";
+    md += `Checked with a rapid workload size of \`${rapidArg}\`:\n\n`;
+    md += `| Runtime | Check Value / Output | Result |\n`;
+    md += `| :--- | :--- | :---: |\n`;
+    for (const r of correctnessMap[suite]) {
+        md += `| ${r.name} | \`${r.output}\` | ${r.passed ? "✅ PASS" : "❌ FAIL"} |\n`;
     }
     md += `\n`;
 
-    // Chart
+    // Chart Section
     md += `## 📊 Performance Chart\n\n`;
-    md += `![Performance chart](${baseName}.svg)\n\n`;
+    md += `![${config.title} performance chart](${svgFileName})\n\n`;
 
-    // Results table
+    // Results Section
     md += `## 📈 Results (sorted by mean time)\n\n`;
-    md += `| # | Runtime | Compiler / Version | Min | Median | Mean | Max | StdDev | CV | Relative Runtime |\n`;
+    md += `| # | Runtime | Version [Flags] | Min | Median | Mean | Max | StdDev | CV | Relative Runtime |\n`;
     md += `| :---: | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n`;
-
+    
     sorted.forEach((r, i) => {
-        const m   = getMeta(r.command);
+        const m = getDisplayInfo(r.command, suite);
         const rel = (r.mean / fastest).toFixed(2);
-        const relStr = i === 0 ? "1.00× _(fastest)_" : `${rel}×`;
+        const relStr = i === 0 ? "1.00× _(fastest)_ 🏆" : `${rel}×`;
         md += `| ${i+1} | **${m.display}** | ${m.compiler} \`[${m.flags}]\` | ${fmt(r.min)} | ${fmt(r.median)} | ${fmt(r.mean)} | ${fmt(r.max)} | ${fmt(r.stddev)} | ${cv(r.mean, r.stddev)} | ${relStr} |\n`;
     });
     md += `\n`;
 
-    // Implementation notes
-    md += `## 📝 Implementation Notes & Fairness\n\n`;
-    md += `- **Algorithm**: All implementations use the same O(n²) pairwise force calculation with identical initial conditions.\n`;
-    md += `- **Zig vs Rust gap**: Zig uses a compile-time \`[5]Body\` stack array enabling full inlining and bound elimination; Rust uses \`Vec<Body>\` (heap) with \`unsafe\` raw-pointer inner loop. This structural difference, not compiler quality, explains the gap.\n`;
-    md += `- **MSVC vs GCC**: With \`/arch:AVX2 /GL /LTCG\` enabled, the gap narrows compared to \`/O2\` alone.\n`;
-    md += `- **JIT runtimes** (Julia, Node, Deno, Bun, LuaJIT): 1 warmup run included before timing; true JIT steady-state may require more iterations to fully optimise.\n`;
-    md += `- **Go GC**: Go's garbage collector may introduce occasional pauses visible in max/StdDev spread.\n`;
-    md += `- **LuaJIT**: Uses standard Lua tables (no FFI). FFI-based implementations can be several times faster.\n`;
-    md += `\n`;
+    // Methodology/Notes Section for this suite
+    md += `## 📝 Methodology & Notes\n\n`;
+    if (suite === "nbody") {
+        md += `- Measures pure floating point loop arithmetic and CPU pipeline scheduling.\n`;
+        md += `- All implementations use standard double precision floats and identical initial conditions.\n`;
+    } else if (suite === "mandelbrot") {
+        md += `- Calculates the Mandelbrot set for a complex plane. Extremely floating-point intensive.\n`;
+        md += `- Tested on a single thread to evaluate raw CPU vector operations and mathematical execution speed.\n`;
+    } else if (suite === "binary_trees") {
+        md += `- Tests pointer chasing, heap allocation, and garbage collection pressure.\n`;
+        md += `- Zig and Rust use custom memory arena pools to achieve zero-allocation times, while JavaScript engines and Go rely on standard runtime garbage collectors.\n`;
+    }
+    md += `- Hyperfine includes a warmup iteration to eliminate JIT startup overhead.\n`;
 
     Deno.writeTextFileSync(reportPath, md);
-    console.log(colors.green(`\n✓ Report → ${path.resolve(reportPath)}`));
-    console.log(colors.green(`✓ Chart  → ${path.resolve(chartPath)}`));
-
-} catch (err) {
-    console.error(colors.red("Error:"), err);
-    Deno.exit(1);
+    console.log(colors.green(`✓ Report Written: ${reportPath}`));
 }
+
+console.log(colors.bold(colors.green("\n✓ All selected benchmark reports successfully generated!")));
